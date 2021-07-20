@@ -1,0 +1,109 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  labels:
+    app: mariadb
+spec:
+  selector:
+    app: mariadb     # 通过选择符将 service 绑定到同一个 namespace 中的某个 Pod 上。如果没有 selector，则需要显式定义 `kind: Endpoints` 来指定（甚至可以是其它namespace）的 ip 地址。
+    tier: database
+  clusterIP: None    # Headless service。database 没有必要对外暴露，kube-proxy 不会为 headless service 分配 ip，也不会为它们进行负载均衡和路由。
+  ports:
+  - protocol: TCP
+    port: 3306
+    targetPort: 3306   # 默认等于 port
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mariadb-pv-claim
+  annotations:
+    volume.beta.kubernetes.io/storage-class: "storage-nfs"
+  labels:
+    app: mariadb
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mariadb
+  labels:
+    app: mariadb
+spec:
+  selector:
+    matchLabels:
+      app: mariadb
+      tier: database
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mariadb
+        tier: database
+    spec:
+      restartPolicy: Always
+      containers:
+      - image: mariadb
+        # imagePullPolicy: Always
+        name: mariadb
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-root-pass
+              key: password
+        ports:
+        - containerPort: 3306
+          name: mariadb
+        volumeMounts:
+        - name: mariadb-storage
+          mountPath: /var/lib/mysql
+        ## Resource
+        resources:
+          requests:
+            # 最少应该为该容器预留的资源量。在尚有多余资源情况下，容器可以使用超过该限制的资源，直到所有可分配的或 limits 所限定的量。
+            # 当一个 Pod 被 Scheduled 的时候， Scheduling is based on `requests` and not `limits`.
+            cpu: 500m               # CPU 的资源分配以秒为参照单位，500m(millicpu) 等等同于 0.5 个 CPU。
+            memory: 1Gi
+          limits:
+            # 容器最多能够使用的资源量，不可以使用超出 limit 属性所设置的资源量。
+            cpu: 1                  # 等同 1000m，也就是 1 秒，或 1 个 CPU。
+            memory: 2Gi
+        ## Health check
+        startupProbe:
+          # startupProbe 是“启动探测器”，这个例子配置了最多 30*10=5m 的时间来等待该 pod 的启动。
+          tcpSocket:                # tcpSocket 是 k8s 内建的一种以 socket 为目标的探针。还有一个常用的探针是 httpGet
+            port: 3306
+          failureThreshold: 30      # 当探测失败时，Kubernetes 的重试次数 。默认值是 3,最小值是 1。
+          periodSeconds: 10         # 每两次探测的时间间隔
+        readinessProbe:
+          # 有些程序虽然启动了，但是依然需要继续等待一段时间才能正常提供服务。readinessProbe（就绪探测器）服务于这个目的的探测。
+          exec:
+            command: 
+            - bash
+            - -c
+            - mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h 127.0.0.1 -e "SELECT 1"   # 注意要处理环境变量
+          initialDelaySeconds: 5    # 初次尝试的等待时间。默认是 0 秒
+          periodSeconds: 5          # 每次尝试的间隔时长。默认是 10 秒。
+          timeoutSeconds: 1         # 每次尝试的超时时长。默认值是 1 秒。
+        livenessProbe:
+          ## LivenessProbe 用于探测应用是否已让存活，如果返回 0，k8s 会尝试重新启动它。
+          exec:
+            command: 
+            - bash
+            - -c
+            - mysqladmin -uroot -p${MYSQL_ROOT_PASSWORD} ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: mariadb-storage
+        persistentVolumeClaim:
+          claimName: mariadb-pv-claim

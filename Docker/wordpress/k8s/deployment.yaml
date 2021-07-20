@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wp-pv-claim
+  namespace: wordpress
+  annotations:
+    app: wordpress
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: wordpress-db-configmap
+  namespace: wordpress
+data:
+  WORDPRESS_DB_NAME: wordpress
+  WORDPRESS_DB_USER: wordpress
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: init-db-configmap
+  namespace: wordpress
+data:
+  # ${MYSQL_ROOT_PASSWORD} environment variable would be provided by Secret.
+  init-db.sh: |
+    #!/bin/bash
+    if [[ ! -z "`mysql -h mariadb -uroot -p${MYSQL_ROOT_PASSWORD} -qfsBe "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME='${WORDPRESS_DB_NAME}'" 2>&1`" ]];
+    then
+      echo "DATABASE ALREADY EXISTS"
+    else
+      echo "CREATING DATABASE AND USER"
+      #sleep infinity
+      mysql -h mariadb -uroot -p${MYSQL_ROOT_PASSWORD} -e "CREATE DATABASE ${WORDPRESS_DB_NAME};"
+      mysql -h mariadb -uroot -p${MYSQL_ROOT_PASSWORD} -e "CREATE USER '${WORDPRESS_DB_USER}'@'%' IDENTIFIED BY '${WORDPRESS_DB_PASSWORD}';"
+      mysql -h mariadb -uroot -p${MYSQL_ROOT_PASSWORD} -e "GRANT ALL PRIVILEGES ON ${WORDPRESS_DB_NAME}.* TO '${WORDPRESS_DB_USER}'@'%';"
+      mysql -h mariadb -uroot -p${MYSQL_ROOT_PASSWORD} -e "FLUSH PRIVILEGES;"
+    fi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  namespace: wordpress
+  labels:
+    app: wordpress
+spec:
+  revisionHistoryLimit: 100
+  selector:
+    matchLabels:
+      app: wordpress
+      tier: frontend
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: wordpress
+        tier: frontend
+    spec:
+      restartPolicy: Always
+      affinity:  # affinity 可以根据 pod 标签来选择执行 node。是一种控制 pod 的分布趋势的手段。
+        # 应用反亲和（排斥）规则。如果希望尽可能调度在同一个节点上，使用 podAffinity
+        podAntiAffinity:
+          # required 表明这是一个硬性要求。如果是 preferred 则表示软性要求。
+          # IgnoredDuringExecution 表示如果节点的标签在运行中发生改变，那么忽略该变化不做重新分配。
+          requiredDuringSchedulingIgnoredDuringExecution:
+            # pod 选择器(如果用的是 nodeAffinity 那么就是 node label 选择器)
+            - labelSelector:
+                # 标签选择的规则是 pod 的标签 "app" 包含有 "zk".
+                # 因为应用的是排斥规则，因此也就是说一个结点上只能运行一个带有 app:wordpress 标签的 pod
+                matchExpressions:
+                  - key: "app"
+                    operator: In
+                    values:
+                    - wordpress
+              topologyKey: "kubernetes.io/hostname"
+              # pod 如果具备 namespace，则需要指定
+              namespaces: ["wordpress"]
+      # Init database
+      initContainers:
+      - name: init-db
+        image: mariadb
+        command: ["bash", "-c", "/init-db.sh"]
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-root-pass
+              key: password
+        - name: WORDPRESS_DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: wordpress-db-configmap
+              key: WORDPRESS_DB_NAME
+        - name: WORDPRESS_DB_USER
+          valueFrom:
+            configMapKeyRef:
+              name: wordpress-db-configmap
+              key: WORDPRESS_DB_USER
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-password
+              key: password
+        volumeMounts:
+        - name: init-db-configmap
+          mountPath: /init-db.sh
+          subPath: init-db.sh
+      ## WordPress
+      containers:
+      - image: wordpress:4.8-apache
+        name: wordpress
+        env:
+        - name: WORDPRESS_DB_HOST
+          value: mariadb
+        - name: WORDPRESS_DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: wordpress-db-configmap
+              key: WORDPRESS_DB_NAME
+        - name: WORDPRESS_DB_USER
+          valueFrom:
+            configMapKeyRef:
+              name: wordpress-db-configmap
+              key: WORDPRESS_DB_USER
+        - name: WORDPRESS_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: database-password
+              key: password
+        ports:
+        - containerPort: 80
+          name: wordpress
+        volumeMounts:
+        - name: wordpress-persistent-storage
+          mountPath: /var/www/html
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 5
+      volumes:
+      - name: wordpress-persistent-storage
+        persistentVolumeClaim:
+          claimName: wp-pv-claim
+      - name: init-db-configmap
+        configMap:
+          name: init-db-configmap
+          defaultMode: 0777
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  namespace: wordpress
+  labels:
+    app: wordpress
+spec:
+  ports:
+    - port: 80
+  selector:
+    app: wordpress
+    tier: frontend
+  type: ClusterIP

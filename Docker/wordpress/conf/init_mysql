@@ -1,0 +1,5 @@
+CREATE DATABASE wordpress CHARACTER SET utf8;
+CREATE USER wordpress IDENTIFIED BY "$1";
+GRANT ALL ON wordpress.* TO 'wordpress'@'%' IDENTIFIED BY "$1";
+GRANT ALL ON wordpress.* TO 'wordpress'@'localhost' IDENTIFIED BY "$1";
+FLUSH PRIVILEGES;
